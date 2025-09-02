@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>QR Scanner & Saver — 500 Cards</title>
+  <style>
+    :root { --bg:#0b1020; --fg:#e9ecf1; --muted:#aab3c5; --accent:#6dd3ff; }
+    html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    .wrap{max-width:1100px;margin:0 auto;padding:16px 18px 60px}
+    h1{font-size:1.25rem;margin:8px 0 14px}
+    .grid{display:grid;grid-template-columns:1fr;gap:14px}
+    @media(min-width:900px){.grid{grid-template-columns:420px 1fr}}
+    .card{background:#121a33;border:1px solid #1e294a;border-radius:16px;padding:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    button,select,input[type="file"],.btn{
+      background:#182349;color:var(--fg);border:1px solid #2a396f;border-radius:12px;
+      padding:10px 14px;font-weight:600;cursor:pointer
+    }
+    button:hover{filter:brightness(1.1)}
+    .pill{display:inline-block;background:#0f1a36;padding:6px 10px;border-radius:999px;border:1px solid #27345f;color:var(--muted)}
+    video{width:100%;border-radius:12px;background:#000;aspect-ratio:3/4}
+    .list{max-height:420px;overflow:auto;border-radius:12px;border:1px solid #1e294a}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px;border-bottom:1px solid #1e294a}
+    th{position:sticky;top:0;background:#0f1833;font-weight:700;text-align:left}
+    a{color:var(--accent);text-decoration:none}
+    a:hover{text-decoration:underline}
+    .muted{color:var(--muted)}
+    .ok{color:#6dffb3}
+    .warn{color:#ffd86d}
+    .danger{color:#ff6d96}
+    .hidden{display:none}
+  </style>
+  <!-- ZXing (barcode/QR) library -->
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.2/umd/index.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <h1>QR Scanner & Saver <span class="pill">Mobile Ready</span></h1>
+    <div class="grid">
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <div class="muted">Camera</div>
+          <div id="camStatus" class="muted">idle</div>
+        </div>
+        <video id="video" muted playsinline autoplay></video>
+        <div class="row" style="margin-top:12px">
+          <button id="btnStart">Start camera</button>
+          <button id="btnStop">Stop</button>
+          <select id="cameraSelect" title="Camera list"></select>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="file" id="fileInput" accept="image/*" />
+          <span class="muted">or upload a photo of the card</span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label class="row" style="gap:6px"><input type="checkbox" id="dedupe" checked /> No duplicates</label>
+          <label class="row" style="gap:6px"><input type="checkbox" id="autostop" /> Stop at 500</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:6px">
+          <div class="muted">Scanned</div>
+          <div><span id="count" class="ok">0</span> / <span id="target" class="muted">500</span></div>
+        </div>
+        <div class="row" style="gap:8px;margin-bottom:10px">
+          <button id="btnCopy">Copy all</button>
+          <button id="btnCSV">Download CSV</button>
+          <button id="btnClear">Clear</button>
+        </div>
+        <div class="list">
+          <table id="tbl">
+            <thead>
+              <tr><th>#</th><th>QR data / Link</th><th class="muted">When</th></tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <div id="last" class="muted" style="margin-top:10px"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // --- State ---
+    const results = [];           // {value, ts}
+    const known = new Set();      // for de-duplication
+    let running = false;
+    let currentDeviceId = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    const video = $("video");
+    const codeReader = new ZXing.BrowserMultiFormatReader();
+
+    // Populate camera list
+    async function listCameras() {
+      try {
+        const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
+        const sel = $("cameraSelect");
+        sel.innerHTML = "";
+        devices.forEach((d,i)=>{
+          const opt = document.createElement("option");
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Camera ${i+1}`;
+          sel.appendChild(opt);
+        });
+        if(devices[0]) currentDeviceId = devices[0].deviceId;
+      } catch(e) {
+        console.warn(e);
+      }
+    }
+
+    $("cameraSelect").addEventListener('change', (e)=>{
+      currentDeviceId = e.target.value;
+      if(running) startCamera();
+    });
+
+    // Start/Stop camera scanning (mobile ready)
+    async function startCamera() {
+      if (!currentDeviceId) await listCameras();
+      $("camStatus").textContent = "starting…";
+
+      try {
+        // Ask for permission first
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { deviceId: currentDeviceId ? { exact: currentDeviceId } : undefined }
+        });
+
+        // Attach to video element so preview shows up
+        video.srcObject = stream;
+        await video.play();
+
+        running = true;
+        await codeReader.decodeFromVideoDevice(currentDeviceId, video, (res, err) => {
+          if(res) handleDecoded(res.getText());
+          if(err && !(err instanceof ZXing.NotFoundException)) {
+            console.warn(err);
+          }
+        });
+        $("camStatus").textContent = "scanning";
+      } catch (e) {
+        $("camStatus").textContent = 'camera error';
+        console.error(e);
+        alert('Camera error: ' + e.message);
+      }
+    }
+
+    async function stopCamera(){
+      running = false;
+      try { codeReader.reset(); video.srcObject?.getTracks().forEach(t=>t.stop()); } catch(e){}
+      $("camStatus").textContent = "stopped";
+    }
+
+    $("btnStart").onclick = startCamera;
+    $("btnStop").onclick = stopCamera;
+
+    // Handle uploaded photo
+    $("fileInput").addEventListener('change', async (e)=>{
+      const f = e.target.files?.[0];
+      if(!f) return;
+      const url = URL.createObjectURL(f);
+      try {
+        const res = await codeReader.decodeFromImageUrl(url);
+        handleDecoded(res.text);
+      } catch(err){
+        alert('Could not read QR in the photo. Try a clearer image.');
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+      e.target.value = '';
+    });
+
+    // When we decode something
+    function handleDecoded(value){
+      const dedupe = $("dedupe").checked;
+      if(dedupe && known.has(value)) return; // already have it
+
+      const ts = new Date();
+      results.push({value, ts});
+      known.add(value);
+
+      // update table
+      const i = results.length;
+      const tr = document.createElement('tr');
+      const tdIdx = document.createElement('td');
+      const tdVal = document.createElement('td');
+      const tdTs  = document.createElement('td');
+      tdIdx.textContent = i;
+      // Make clickable if it looks like a link
+      if(/^https?:\/\//i.test(value)){
+        const a = document.createElement('a');
+        a.href = value; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = value;
+        tdVal.appendChild(a);
+      } else {
+        tdVal.textContent = value;
+      }
+      tdTs.textContent = ts.toLocaleString();
+      tr.append(tdIdx, tdVal, tdTs);
+      $("tbody").prepend(tr); // newest on top
+
+      $("count").textContent = results.length;
+      $("last").innerHTML = `Last: <span class="ok">${escapeHtml(value)}</span>`;
+
+      if($("autostop").checked && results.length >= 500){ stopCamera(); }
+    }
+
+    function escapeHtml(s){
+      return s.replace(/[&<>\"]/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[m]));
+    }
+
+    // Copy / CSV / Clear
+    $("btnCopy").onclick = async () => {
+      const text = results.map(r=>r.value).join("\n");
+      await navigator.clipboard.writeText(text);
+      alert('Copied ' + results.length + ' items to clipboard');
+    };
+
+    $("btnCSV").onclick = () => {
+      const rows = [["index","value","timestamp"], ...results.map((r,i)=>[i+1,r.value,r.ts.toISOString()])];
+      const csv = rows.map(r=>r.map(x=>`"${String(x).replaceAll('"','""')}"`).join(',')).join('\n');
+      const blob = new Blob([csv], {type:'text/csv'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `qr-cards-${new Date().toISOString().slice(0,10)}.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+    };
+
+    $("btnClear").onclick = () => {
+      if(!confirm('Clear the scanned list?')) return;
+      results.length = 0; known.clear();
+      $("tbody").innerHTML = '';
+      $("count").textContent = '0';
+      $("last").textContent = '';
+    };
+
+    // Init
+    listCameras();
+  </script>
+</body>
+</html>
